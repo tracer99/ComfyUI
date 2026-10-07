@@ -1,0 +1,7 @@
+-r requirements.txt
+torch==2.4.1
+torchvision==0.19.1
+torchaudio==2.4.1
+torch-directml==0.2.5.dev240914
+transformers==4.50.3
+huggingface-hub==0.30.2

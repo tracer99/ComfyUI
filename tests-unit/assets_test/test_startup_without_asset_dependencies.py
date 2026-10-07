@@ -7,7 +7,7 @@ import pytest
 
 # A None entry in sys.modules makes any import of that package raise ImportError.
 STARTUP_SCRIPT = (
-    "import sys, runpy, comfy_kitchen; "
+    "import sys, runpy, comfy.torch_directml_compat, comfy_kitchen; "
     "sys.modules.update(dict.fromkeys(('sqlalchemy', 'alembic', 'blake3'))); "
     "comfy_kitchen.int8_attention_is_available=lambda: False; "
     'runpy.run_path("main.py", run_name="__main__")'

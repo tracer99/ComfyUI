@@ -1,0 +1,36 @@
+name: Windows ARM compatibility
+
+on:
+  push:
+    branches: [codex/windows-arm]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  directml:
+    runs-on: windows-2022
+    strategy:
+      matrix:
+        python: ['3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-windows-arm.txt
+            tests-unit/requirements.txt
+      - name: Install DirectML dependencies
+        run: python -m pip install -r requirements-windows-arm.txt -r tests-unit/requirements.txt
+      - name: Check dependencies
+        run: python -m pip check
+      - name: Test ARM helpers and CPU fallback
+        run: python -c "from comfy.cli_args import args; args.cpu = True; import pytest; raise SystemExit(pytest.main(['tests-unit/comfy_test/windows_arm_test.py', 'tests-unit/comfy_test/directml_attention_test.py', 'tests-unit/comfy_test/opaque_tensor_test.py', 'tests-unit/comfy_test/torch_directml_compat_test.py', 'tests-unit/comfy_test/qnn_runtime_test.py', 'tests-unit/comfy_test/snapdragon_qnn_backend_test.py', 'tests-unit/comfy_test/logger_test.py', 'tests-unit/execution_test/directml_retry_test.py', '-q']))"
+      - name: Verify CPU startup
+        run: python main.py --cpu --offline --disable-all-custom-nodes --quick-test-for-ci

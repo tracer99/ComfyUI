@@ -2502,6 +2502,7 @@ async def init_builtin_extra_nodes():
         "nodes_seedvr.py",
         "nodes_context_windows.py",
         "nodes_qwen.py",
+        "nodes_qnn.py",
         "nodes_ming.py",
         "nodes_mage.py",
         "nodes_joyimage.py",

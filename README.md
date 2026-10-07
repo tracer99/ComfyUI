@@ -1,3 +1,11 @@
+## Windows ARM fork
+
+This fork preserves [Comfy-Org/ComfyUI](https://github.com/Comfy-Org/ComfyUI)'s Git history and ports Windows ARM support from [Sasen12/ComfyUI-ARM-Windows](https://github.com/Sasen12/ComfyUI-ARM-Windows). The ARM implementation is on `codex/windows-arm`; the upstream base is ComfyUI 0.39.0, commit `b00c6e95279053474955540ba4f551646722b9aa`.
+
+Install **x64 Python 3.11 or 3.12** on Windows ARM, then run `start-arm.cmd`. The launcher creates a project virtual environment and installs the DirectML dependencies. Use `start-arm.cmd -Port 8189` when another instance already uses port 8188.
+
+See [Windows ARM setup and validation](docs/windows-arm.md) for runtime selection, limitations, and upstream updates. Native ARM64 QNN support remains experimental.
+
 <div align="center">
 
 # ComfyUI

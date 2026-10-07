@@ -8,7 +8,7 @@ from app.assets.event_log import TAG
 
 
 STARTUP_SCRIPT = (
-    "import runpy, comfy_kitchen; "
+    "import runpy, comfy.torch_directml_compat, comfy_kitchen; "
     "comfy_kitchen.int8_attention_is_available=lambda: False; "
     'runpy.run_path("main.py", run_name="__main__")'
 )

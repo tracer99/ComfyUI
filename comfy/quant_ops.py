@@ -1,5 +1,6 @@
 import torch
 import logging
+import comfy.torch_directml_compat  # noqa: F401
 
 from comfy.cli_args import args
 

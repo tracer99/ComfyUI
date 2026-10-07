@@ -23,4 +23,7 @@ web_custom_versions/
 .DS_Store
 filtered-openapi.yaml
 uv.lock
+.arm-bootstrap-*.stamp
+.runtime/
+.venv-qnn/
 .comfy_environment

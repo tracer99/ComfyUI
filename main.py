@@ -14,6 +14,7 @@ import os
 import importlib.util
 import shutil
 import importlib.metadata
+import platform
 import folder_paths
 import time
 from comfy.cli_args import enables_dynamic_vram
@@ -36,6 +37,7 @@ import sys
 from comfy_execution.progress import get_progress_state
 from comfy_execution.utils import get_executing_context
 from comfy_api import feature_flags
+from comfy.windows_arm import describe_windows_arm_state, is_windows_on_arm64_host, is_windows_x64_emulated_on_arm64, preferred_windows_arm_runtime
 
 if __name__ == "__main__":
     #NOTE: These do not do anything on core ComfyUI, they are for custom nodes.
@@ -70,19 +72,29 @@ if __name__ == "__main__" and args.debug_hang:
 
     signal.signal(signal.SIGINT, dump_traceback_on_sigint)
 
-import comfy_aimdo.control
+comfy_aimdo_control = None
+if is_windows_on_arm64_host():
+    logging.info("Skipping comfy-aimdo control backend on Windows ARM; it is NVIDIA-only.")
+else:
+    try:
+        import comfy_aimdo.control as comfy_aimdo_control
+    except Exception as e:
+        logging.warning(
+            "comfy-aimdo control backend unavailable. DynamicVRAM support will be disabled. Details: %s",
+            e,
+        )
 
-if enables_dynamic_vram():
+if comfy_aimdo_control is not None and enables_dynamic_vram():
     simple_vram_headroom = None if args.reserve_vram is None else int(args.reserve_vram * 1024 ** 3)
     try:
-        comfy_aimdo.control.init(simple_vram_headroom=simple_vram_headroom, nvml_pressure=not args.disable_nvml_pressure)
+        comfy_aimdo_control.init(simple_vram_headroom=simple_vram_headroom, nvml_pressure=not args.disable_nvml_pressure)
     except TypeError:
         # comfy-aimdo 0.4.10 protocol.
         try:
-            comfy_aimdo.control.init(simple_vram_headroom=simple_vram_headroom)
+            comfy_aimdo_control.init(simple_vram_headroom=simple_vram_headroom)
         except TypeError:
             # comfy-aimdo 0.4.9 protocol.
-            comfy_aimdo.control.init()
+            comfy_aimdo_control.init()
 
 if os.name == "nt":
     os.environ['MIMALLOC_PURGE_DELAY'] = '0'
@@ -279,32 +291,32 @@ def dynamic_vram_supported():
     return False
 
 
-if args.enable_dynamic_vram or (enables_dynamic_vram() and dynamic_vram_supported()):
+if comfy_aimdo_control is not None and (args.enable_dynamic_vram or (enables_dynamic_vram() and dynamic_vram_supported())):
     if (not args.enable_dynamic_vram) and (comfy.model_management.torch_version_numeric < (2, 8)):
         logging.warning("Unsupported Pytorch detected. DynamicVRAM support requires Pytorch version 2.8 or later (2.12+ is recommended). Falling back to legacy ModelPatcher. VRAM estimates may be unreliable especially on Windows")
     else:
         try:
-            aimdo_initialized = comfy_aimdo.control.init_devices((d.index, int(args.vram_headroom * 1024 ** 3)) for d in comfy.model_management.get_all_torch_devices())
+            aimdo_initialized = comfy_aimdo_control.init_devices((d.index, int(args.vram_headroom * 1024 ** 3)) for d in comfy.model_management.get_all_torch_devices())
         except TypeError:
             # comfy-aimdo 0.4.9 protocol.
-            aimdo_initialized = comfy_aimdo.control.init_devices(d.index for d in comfy.model_management.get_all_torch_devices())
+            aimdo_initialized = comfy_aimdo_control.init_devices(d.index for d in comfy.model_management.get_all_torch_devices())
 
         if aimdo_initialized:
             if console_log_level == 'DEBUG':
-                comfy_aimdo.control.set_log_debug()
+                comfy_aimdo_control.set_log_debug()
             elif console_log_level == 'DETAIL':
                 try:
-                    comfy_aimdo.control.set_log_detail()
+                    comfy_aimdo_control.set_log_detail()
                 except AttributeError:
-                    comfy_aimdo.control.set_log_info()
+                    comfy_aimdo_control.set_log_info()
             elif console_log_level == 'CRITICAL':
-                comfy_aimdo.control.set_log_critical()
+                comfy_aimdo_control.set_log_critical()
             elif console_log_level == 'ERROR':
-                comfy_aimdo.control.set_log_error()
+                comfy_aimdo_control.set_log_error()
             elif console_log_level == 'WARNING':
-                comfy_aimdo.control.set_log_warning()
+                comfy_aimdo_control.set_log_warning()
             else: #INFO
-                comfy_aimdo.control.set_log_info()
+                comfy_aimdo_control.set_log_info()
 
             comfy.model_patcher.CoreModelPatcher = comfy.model_patcher.ModelPatcherDynamic
             comfy.memory_management.aimdo_enabled = True
@@ -599,6 +611,46 @@ def start_comfyui(asyncio_loop=None):
 if __name__ == "__main__":
     # Running directly, just start ComfyUI.
     logging.info("Python version: {}".format(sys.version))
+    platform_description = describe_windows_arm_state() if is_windows_on_arm64_host() else platform.machine()
+    logging.info("Platform: {} {}".format(platform.system(), platform_description))
+    if is_windows_on_arm64_host():
+        logging.info("Detected {}.".format(describe_windows_arm_state()))
+        runtime_hint = preferred_windows_arm_runtime()
+        if runtime_hint == "qnn":
+            from comfy import qnn_runtime
+
+            logging.info(
+                "Snapdragon QNN mode selected. This fork uses native ARM64 Python 3.11 for the QNN lane."
+            )
+            qnn_status = qnn_runtime.get_status()
+            logging.info("QNN status: %s", qnn_runtime.describe_status())
+            if not qnn_status["onnxruntime_available"]:
+                logging.warning(
+                    "QNN is not active because the onnxruntime Python package is missing. "
+                    "Install the QNN requirements and try again."
+                )
+            elif not qnn_status["qnn_provider_available"]:
+                logging.warning(
+                    "QNN is installed, but no Qualcomm QNN execution-provider devices were discovered. "
+                    "The snapdragon/qnn nodes will stay on CPU until a QNN device appears."
+                )
+            elif not qnn_status["qnn_npu_device_available"]:
+                logging.warning(
+                    "QNN devices are available, but no Snapdragon NPU device was discovered. "
+                    "The QNN lane can still run on other QNN-capable devices, but the Snapdragon NPU path is not active yet."
+                )
+            else:
+                logging.info(
+                    "Snapdragon NPU device detected. Standard text-to-image denoising will try the QNN-backed path first, "
+                    "and unsupported workflows will fall back to PyTorch."
+                )
+        elif is_windows_x64_emulated_on_arm64():
+            logging.info("x64 emulation is a good match for the current DirectML dependency layout.")
+        else:
+            logging.warning(
+                "This ARM fork is most reliable with x64 Python 3.11 or 3.12 under Windows emulation for the DirectML lane. "
+                "Use launch-arm-qnn.cmd if you want the Snapdragon QNN lane with native ARM64 Python 3.11."
+            )
     logging.info("ComfyUI version: {}".format(comfyui_version.__version__))
     for package in ("comfy-aimdo", "comfy-kitchen"):
         try:
