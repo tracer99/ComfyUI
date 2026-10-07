@@ -36,6 +36,7 @@ import comfy.quant_ops
 import comfy_aimdo.host_buffer
 import comfy_aimdo.vram_buffer
 from comfy.internal_logging import detail
+from comfy.windows_arm import describe_windows_arm_state, directml_uses_shared_memory, is_windows_on_arm64_host, should_auto_enable_directml
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -109,18 +110,78 @@ if args.deterministic:
     torch.use_deterministic_algorithms(True, warn_only=True)
 
 directml_enabled = False
-if args.directml is not None:
-    logging.warning("WARNING: torch-directml barely works, is very slow, has not been updated in over 1 year and might be removed soon, please don't use it, there are better options.")
-    import torch_directml
-    directml_enabled = True
-    device_index = args.directml
-    if device_index < 0:
-        directml_device = torch_directml.device()
-    else:
-        directml_device = torch_directml.device(device_index)
-    logging.info("Using directml with device: {}".format(torch_directml.device_name(device_index)))
-    # torch_directml.disable_tiled_resources(True)
-    lowvram_available = False #TODO: need to find a way to get free memory in directml before this can be enabled by default.
+directml_device = None
+directml_device_name = None
+directml_shared_memory = False
+
+
+def initialize_directml():
+    global directml_enabled
+    global directml_device
+    global directml_device_name
+    global directml_shared_memory
+    global lowvram_available
+
+    device_index = None
+    auto_enabled = False
+
+    if args.directml is not None:
+        device_index = args.directml
+    elif should_auto_enable_directml() and not args.cpu:
+        device_index = -1
+        auto_enabled = True
+
+    if device_index is None:
+        return
+
+    try:
+        import torch_directml
+    except Exception as e:
+        if auto_enabled:
+            logging.warning(
+                "Detected Windows on ARM64, but torch-directml could not be imported. "
+                "Falling back to CPU mode. Details: {}".format(e)
+            )
+        else:
+            logging.warning(
+                "DirectML was requested, but torch-directml could not be imported. "
+                "Falling back to CPU mode. Details: {}".format(e)
+            )
+        return
+
+    try:
+        if auto_enabled:
+            logging.info(
+                "Windows on ARM64 detected (%s). Attempting DirectML as the default backend.",
+                describe_windows_arm_state(),
+            )
+        else:
+            logging.warning(
+                "WARNING: torch-directml barely works, is very slow, has not been updated in over 1 year and might be removed soon, please don't use it, there are better options."
+            )
+
+        directml_enabled = True
+        if device_index < 0:
+            device_index = torch_directml.default_device()
+            directml_device = torch_directml.device()
+        else:
+            directml_device = torch_directml.device(device_index)
+        directml_device_name = torch_directml.device_name(device_index)
+        directml_shared_memory = directml_uses_shared_memory()
+        logging.info("Using DirectML with device: {}".format(directml_device_name))
+        # torch_directml.disable_tiled_resources(True)
+        lowvram_available = False #TODO: need to find a way to get free memory in directml before this can be enabled by default.
+    except Exception as e:
+        directml_enabled = False
+        directml_device = None
+        directml_device_name = None
+        directml_shared_memory = False
+        logging.warning(
+            "DirectML initialization failed, falling back to CPU mode. Details: {}".format(e)
+        )
+
+
+initialize_directml()
 
 
 try:
@@ -156,6 +217,9 @@ except:
     ixuca_available = False
 
 if args.cpu:
+    cpu_state = CPUState.CPU
+
+if not directml_enabled and is_windows_on_arm64_host() and not args.cpu:
     cpu_state = CPUState.CPU
 
 def is_intel_xpu():
@@ -322,7 +386,12 @@ def get_total_memory(dev=None, torch_total_too=False):
         mem_total = comfy.system_memory.virtual_memory_total()
         mem_total_torch = mem_total
     else:
-        if directml_enabled:
+        if directml_enabled and directml_shared_memory:
+            # Snapdragon / Windows on ARM GPUs share system memory, so use RAM totals for budgeting.
+            shared_memory = psutil.virtual_memory()
+            mem_total = shared_memory.total
+            mem_total_torch = mem_total
+        elif directml_enabled:
             mem_total = 1024 * 1024 * 1024 #TODO
             mem_total_torch = mem_total
         elif is_intel_xpu():
@@ -363,7 +432,8 @@ def mac_version():
 
 total_vram = get_total_memory(get_torch_device()) / (1024 * 1024)
 total_ram = comfy.system_memory.virtual_memory_total() / (1024 * 1024)
-logging.info("Total VRAM {:0.0f} MB, total RAM {:0.0f} MB".format(total_vram, total_ram))
+memory_label = "shared memory" if directml_enabled and directml_shared_memory else "VRAM"
+logging.info("Total {} {:0.0f} MB, total RAM {:0.0f} MB".format(memory_label, total_vram, total_ram))
 cgroup_ram_limit = comfy.system_memory.cgroup_memory_limit()
 if cgroup_ram_limit is not None:
     logging.info("RAM limited by cgroup to {:0.0f} MB (host has {:0.0f} MB)".format(cgroup_ram_limit / (1024 * 1024), psutil.virtual_memory().total / (1024 * 1024)))
@@ -389,7 +459,14 @@ except AttributeError:
 def is_oom(e):
     if isinstance(e, OOM_EXCEPTION):
         return True
-    if isinstance(e, ACCELERATOR_ERROR) and (getattr(e, 'error_code', None) == 2 or "out of memory" in str(e).lower()):
+    message = str(e).lower()
+    if "could not allocate tensor" in message and ("gpu video memory" in message or "not enough memory" in message or "out of memory" in message):
+        discard_cuda_async_error()
+        return True
+    if "not enough gpu video memory" in message:
+        discard_cuda_async_error()
+        return True
+    if isinstance(e, ACCELERATOR_ERROR) and (getattr(e, 'error_code', None) == 2 or "out of memory" in message):
         discard_cuda_async_error()
         return True
     return False
@@ -397,6 +474,34 @@ def is_oom(e):
 def raise_non_oom(e):
     if not is_oom(e):
         raise e
+
+
+def should_retry_on_cpu_after_oom(e):
+    return is_directml_enabled() and not cpu_mode() and is_oom(e)
+
+
+def switch_to_cpu_mode(reason=None):
+    global cpu_state
+    global directml_enabled
+    global directml_device
+    global directml_device_name
+    global directml_shared_memory
+    global vram_state
+    global set_vram_to
+
+    if reason is not None:
+        logging.warning("Switching to CPU mode after DirectML OOM: {}".format(reason))
+
+    cpu_state = CPUState.CPU
+    directml_enabled = False
+    directml_device = None
+    directml_device_name = None
+    directml_shared_memory = False
+    vram_state = VRAMState.DISABLED
+    set_vram_to = VRAMState.DISABLED
+
+    if hasattr(args, "cpu"):
+        args.cpu = True
 
 XFORMERS_VERSION = ""
 XFORMERS_ENABLED_VAE = True
@@ -593,6 +698,9 @@ if cpu_state != CPUState.GPU:
 
 if cpu_state == CPUState.MPS:
     vram_state = VRAMState.SHARED
+elif directml_enabled and directml_shared_memory and vram_state == VRAMState.NORMAL_VRAM:
+    # Treat Windows ARM DirectML like other shared-memory backends.
+    vram_state = VRAMState.SHARED
 
 logging.info(f"Set vram state to: {vram_state.name}")
 
@@ -602,6 +710,10 @@ if DISABLE_SMART_MEMORY:
     logging.info("Disabling smart memory management")
 
 def get_torch_device_name(device):
+    if directml_enabled:
+        if directml_device_name is not None:
+            return "DirectML {}".format(directml_device_name)
+        return "DirectML {}".format(device)
     if hasattr(device, 'type'):
         if device.type == "cuda":
             try:
@@ -1562,7 +1674,7 @@ def cast_to_gathered(tensors, r, non_blocking=False, stream=None, r2=None):
                 continue
             if comfy.memory_management.read_tensor_file_slice_into(tensor, dest_view, stream=stream, destination2=dest2_view):
                 continue
-            storage = tensor._qdata.untyped_storage() if isinstance(tensor, comfy.quant_ops.QuantizedTensor) else tensor.untyped_storage()
+            storage = comfy.memory_management.get_untyped_storage(tensor)
             mark_mmap_dirty(storage)
             if dest_view is not None:
                 dest_view.copy_(tensor, non_blocking=non_blocking)
@@ -1817,7 +1929,12 @@ def get_free_memory(dev=None, torch_free_too=False):
         mem_free_total = comfy.system_memory.virtual_memory_available()
         mem_free_torch = mem_free_total
     else:
-        if directml_enabled:
+        if directml_enabled and directml_shared_memory:
+            # Shared-memory GPUs should track available system RAM instead of a fake VRAM ceiling.
+            shared_memory = psutil.virtual_memory()
+            mem_free_total = shared_memory.available
+            mem_free_torch = mem_free_total
+        elif directml_enabled:
             mem_free_total = 1024 * 1024 * 1024 #TODO
             mem_free_torch = mem_free_total
         elif is_intel_xpu():

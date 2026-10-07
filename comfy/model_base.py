@@ -87,6 +87,7 @@ import comfy.model_management
 import comfy.patcher_extension
 import comfy.conds
 import comfy.ops
+import comfy.snapdragon_qnn_backend as snapdragon_qnn_backend
 from enum import Enum
 from . import utils
 import comfy.latent_formats
@@ -175,6 +176,9 @@ class BaseModel(torch.nn.Module):
         self.manual_cast_dtype = model_config.manual_cast_dtype
         self.device = device
         self.current_patcher: 'ModelPatcher' = None
+        self._snapdragon_qnn_backend = None
+        self._snapdragon_qnn_backend_disabled = False
+        self._snapdragon_qnn_backend_error = None
 
         if not unet_config.get("disable_unet_model_creation", False):
             if model_config.custom_operations is None:
@@ -251,11 +255,24 @@ class BaseModel(torch.nn.Module):
             self.current_patcher is not None and self.current_patcher.is_dynamic()
         )
 
-        model_output = self.diffusion_model(xc, t, context=context, control=control, transformer_options=transformer_options, **extra_conds)
+        model_output = snapdragon_qnn_backend.try_apply_qnn_backend(
+            self, xc, t, context, c_concat=c_concat, control=control,
+            transformer_options=transformer_options, extra_conds=extra_conds,
+        )
+        if model_output is None:
+            model_output = self.diffusion_model(xc, t, context=context, control=control, transformer_options=transformer_options, **extra_conds)
         if len(model_output) > 1 and not torch.is_tensor(model_output):
             model_output, _ = utils.pack_latents(model_output)
 
         return self.model_sampling.calculate_denoised(sigma, model_output.float(), x)
+
+    def __del__(self):
+        backend = getattr(self, "_snapdragon_qnn_backend", None)
+        if backend is not None:
+            try:
+                backend.close()
+            except Exception:
+                pass
 
     def process_timestep(self, timestep, **kwargs):
         return timestep

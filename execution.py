@@ -675,6 +675,7 @@ class PromptExecutor:
         self.caches = CacheSet(cache_type=self.cache_type, cache_args=self.cache_args)
         self.status_messages = []
         self.success = True
+        self.cpu_retry_error = None
 
     def add_message(self, event, data: dict, broadcast: bool):
         data = {
@@ -686,6 +687,9 @@ class PromptExecutor:
             self.server.send_sync(event, data, self.server.client_id)
 
     def handle_execution_error(self, prompt_id, prompt, current_outputs, executed, error, ex):
+        if comfy.model_management.should_retry_on_cpu_after_oom(ex):
+            self.cpu_retry_error = ex
+            return
         node_id = error["node_id"]
         class_type = prompt[node_id]["class_type"]
 
@@ -730,6 +734,17 @@ class PromptExecutor:
         asyncio.run(self.execute_async(prompt, prompt_id, extra_data, execute_outputs))
 
     async def execute_async(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
+        self.cpu_retry_error = None
+        await self._execute_async_once(prompt, prompt_id, extra_data, execute_outputs)
+        if self.cpu_retry_error is not None:
+            logging.warning("DirectML ran out of memory; retrying the prompt on CPU.")
+            comfy.model_management.unload_all_models()
+            comfy.model_management.switch_to_cpu_mode(self.cpu_retry_error)
+            comfy.model_management.cleanup_models_gc()
+            self.reset()
+            await self._execute_async_once(prompt, prompt_id, extra_data, execute_outputs)
+
+    async def _execute_async_once(self, prompt, prompt_id, extra_data, execute_outputs):
         set_preview_method(extra_data.get("preview_method"))
 
         nodes.interrupt_processing(False)
